@@ -11,7 +11,6 @@ WORKDIR /app
 COPY src   /app/src
 COPY flows /app/flows
 COPY examples /app/examples
-COPY prompts /app/prompts
 
 # ------------ Copy dependency files ------------
 COPY pyproject.toml  /app/
