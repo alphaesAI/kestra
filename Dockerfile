@@ -1,4 +1,4 @@
-FROM kestra/kestra:latest
+FROM kestra/kestra:latest-slim
 
 # Switch to root to install system dependencies & python packages
 USER root
@@ -15,7 +15,7 @@ COPY README.md       /app/
 
 # Install dependencies using standard pip (cleaner than setting up uv in a Java container)
 RUN apt-get update && apt-get install -y python3-pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+    pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 # Drop back to the secure non-root Kestra user
 USER kestra
