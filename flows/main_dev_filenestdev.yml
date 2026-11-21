@@ -234,7 +234,7 @@ tasks:
           document["patient_id"] = patient_id
 
           # Persist to destination storage
-          out_dir = AI_PLATFORM / "storage" / "emr" / "transformed"
+          out_dir = app_dir / "storage" / "emr" / "transformed"
           out_dir.mkdir(parents=True, exist_ok=True)
           file_id_short = file_id[:8] if file_id else "unknown"
           file_stem = Path(filename).stem if filename else "document"
@@ -275,11 +275,5 @@ tasks:
       # Step G: Clean up temporary downloaded file from internal storage
       - id: cleanup_temp_file
         type: io.kestra.plugin.core.storage.Delete
-        uri: "{{ outputs.download_filenest_file.uri }}"
-        errorOnMissing: false
-
-      # Step G: Clean up temporary downloaded file from internal storage
-      - id: cleanup_temp_file
-        type: io.kestra.plugin.core.storage.Delete  
         uri: "{{ outputs.download_filenest_file.uri }}"
         errorOnMissing: false

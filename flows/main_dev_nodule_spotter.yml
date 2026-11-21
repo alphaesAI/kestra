@@ -1,0 +1,137 @@
+id: nodule_spotter
+namespace: dev
+
+inputs:
+  - id: slice_path
+    type: STRING
+    defaults: "lung.jpg"
+
+  - id: moe_config_path
+    type: STRING
+    defaults: "/app/src/nodule_spotter/configs/moe_detection_release.yaml"
+
+tasks:
+  - id: pipeline
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: call_load_slice
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        namespaceFiles:
+          enabled: true
+        dependencies:
+          - Pillow
+          - numpy
+        outputFiles:
+          - slice_image.npy
+        script: |
+          import sys
+          from pathlib import Path
+          import numpy as np
+          sys.path.append("/app/src")
+
+          from nodule_spotter.main import load_slice
+          result = load_slice(Path("{{ inputs.slice_path }}"))
+          # Ensure slice_image.npy is saved to the working directory if needed downstream
+          print(result)
+          np.save("slice_image.npy", result)
+
+      - id: run_moe
+        type: io.kestra.plugin.scripts.python.Commands
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          PYTHONPATH: /app/src
+        inputFiles:
+          slice_image.npy: "{{ outputs.call_load_slice.outputFiles['slice_image.npy'] }}"
+          run.py: |
+            import asyncio
+            import pickle
+            import numpy as np
+            import sys
+            sys.path.append("/app/src")
+
+            from nodule_spotter.detectors import build_detector
+            from kestra import Kestra
+            from nodule_spotter.moe import MixtureOfExperts
+            from nodule_spotter.settings import SpotterSettings
+
+            slice_image = np.load("slice_image.npy")
+            settings = SpotterSettings.load("{{ inputs.moe_config_path }}")
+
+            detectors = [build_detector(spec) for spec in settings.detectors]
+            moe = MixtureOfExperts(
+                detectors,
+                max_concurrency=settings.max_concurrency,
+                fail_fast=settings.fail_fast,
+            )
+
+            candidates = asyncio.run(moe.run_slice(slice_image, slice_idx=0))
+            print(f"MoE produced {len(candidates)} raw mask candidate(s)")
+
+            with open("candidates.pkl", "wb") as f:
+                pickle.dump(candidates, f)
+
+            Kestra.outputs({
+                "num_candidates": len(candidates),
+                "candidate_sources": [c.source for c in candidates],
+            })
+        beforeCommands:
+          - uv venv
+          - uv pip install --no-cache "setuptools<70" wheel
+          - uv pip install --no-cache torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+          - uv pip install --no-cache kestra numpy pyyaml huggingface-hub
+          - uv pip install --no-cache --no-build-isolation mmcv -f https://download.openmmlab.com/mmcv/dist/cpu/torch2.1.0/index.html
+          - uv pip install --no-cache --no-build-isolation mmdet
+        commands:
+          - .venv/bin/python run.py
+        outputFiles:
+          - candidates.pkl
+
+      - id: run_clusterer
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          PYTHONPATH: /app/src
+        dependencies:
+          - kestra
+        script: |
+          import pickle
+          from kestra import Kestra
+          from nodule_spotter.clustering import MaskClusterer
+          from nodule_spotter.settings import SpotterSettings
+
+          with open("candidates.pkl", "rb") as f:
+              candidates = pickle.load(f)
+
+          # Fixed: using inputs.moe_config_path instead of inputs.config_path
+          settings = SpotterSettings.load("{{ inputs.moe_config_path }}")
+          clusterer = MaskClusterer(
+              eps=settings.clustering.eps,
+              min_samples=settings.clustering.min_samples,
+              min_unique_experts=settings.clustering.min_unique_experts,
+              binarize_threshold=settings.clustering.binarize_threshold,
+          )
+
+          clusters = clusterer.cluster(candidates)
+          print(f"Clusterer generated {len(clusters)} cluster(s)")
+
+          with open("clusters.pkl", "wb") as f:
+              pickle.dump(clusters, f)
+
+          summary = [
+              {
+                  "cluster_id": c.cluster_id,
+                  "is_noise": c.is_noise,
+                  "sources": c.sources(),
+                  "member_count": len(c.members),
+              }
+              for c in clusters
+          ]
+
+          Kestra.outputs({
+              "num_clusters": len(clusters),
+              "clusters_summary": summary
+          })

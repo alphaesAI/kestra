@@ -1,0 +1,53 @@
+# nodule_spotter standalone-CLI configuration template
+#
+# THIS FILE IS ONLY USED BY:
+#   python -m nodule_spotter.main  (the standalone detection CLI)
+#
+# If you are running the full pipeline via main.py, this file is NOT read.
+# Spotter settings for the pipeline are configured in the root config.yaml
+# under the "spotter:" section (see config.example.yaml).
+#
+# To use the standalone CLI:
+#   cp nodule_spotter/config.example.yaml nodule_spotter/config.yaml
+#   # edit the detector roster; API credentials are only needed for VLM judges
+#   python -m nodule_spotter.main --config nodule_spotter/config.yaml ...
+
+defaults:
+  api_base: https://your-openai-compatible-endpoint/v1
+  api_key:  sk-replace-me
+  model:    gpt-4o
+
+nodule_spotter:
+  # This standalone smoke configuration deliberately uses one lightweight
+  # detector. Add distinct model-backed experts for cross-expert consensus.
+  detectors:
+    - type: classical
+      name: classical_smoke
+
+  max_concurrency: 1
+  fail_fast: true
+  max_masks: 1
+
+  clustering:
+    # DBSCAN neighborhood radius in IoU-distance units (1 - IoU).
+    # eps=0.5 is equivalent to an IoU threshold of 0.5.
+    eps: 0.5
+    # Minimum proposals that must share a neighborhood for a cluster to
+    # form. Distinct-expert agreement is enforced separately below.
+    min_samples: 1
+    # The smoke configuration has one expert. Production MoE configurations
+    # should set this to 2 or more.
+    min_unique_experts: 1
+    # Per-pixel mean threshold applied after averaging cluster members.
+    binarize_threshold: 0.5
+
+  judging_panel:
+    # Candidate accepted iff sum(sign_j * confidence_j) > this value.
+    accept_threshold: 0.0
+    # How the image + mask pair is shown to each VLM:
+    #   overlay — one composite image with the mask drawn in red
+    #   pair    — two images (CT slice, binary mask) in one message
+    input_mode: overlay
+
+    # Leave empty for detector + clustering inference without external APIs.
+    judges: []

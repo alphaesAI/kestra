@@ -4,4 +4,13 @@ pydantic-settings
 python-dotenv
 openai
 httpx
-
+Pillow
+numpy<2.0.0
+pyyaml>=6.0
+scikit-learn>=1.3.0
+scipy>=1.10.0
+huggingface-hub>=0.23
+pycocotools>=2.0.7
+mmengine==0.10.7
+mmdet==3.3.0
+litellm>=1.0.0

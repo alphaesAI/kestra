@@ -1,0 +1,54 @@
+# Reproducible public Nodule Spotter MoE configuration.
+# Artifacts are downloaded lazily from the pinned Hugging Face revision.
+
+nodule_spotter:
+  detectors:
+    - type: mmdet
+      name: retinanet_r18_fpn
+      repo_id: YangC777/LungNoduleAgent
+      revision: f49837be54935361660b0fd9104ba52c72859fe3
+      config_file: DetectionModel/retinanet/retinanet_r18_fpn_shenzhen.py
+      checkpoint_file: DetectionModel/retinanet/retinanet_r18_fpn_shenzhen.pth
+      checkpoint_sha256: 15b2420592825d5ddff0bf3b4ff8a9beb73fdefd847e274eb558c18b906b4f98
+      device: cpu
+      score_thr: 0.3
+      class_ids: [0]
+      box_mode: ellipse
+
+    - type: mmdet
+      name: faster_rcnn_r50_fpn
+      repo_id: YangC777/LungNoduleAgent
+      revision: f49837be54935361660b0fd9104ba52c72859fe3
+      config_file: DetectionModel/faster_rcnn/faster_rcnn_r50_fpn_shenzhen.py
+      checkpoint_file: DetectionModel/faster_rcnn/faster_rcnn_r50_fpn_shenzhen.pth
+      checkpoint_sha256: fd514f7391ff6121d3d43cf00cc8013a71bfef420e14d1f9a032ff276ac8e0b2
+      device: cpu
+      score_thr: 0.3
+      class_ids: [0]
+      box_mode: ellipse
+
+    - type: mmdet
+      name: dino_r50_4scale
+      repo_id: YangC777/LungNoduleAgent
+      revision: f49837be54935361660b0fd9104ba52c72859fe3
+      config_file: DetectionModel/dino/dino_r50_4scale_shenzhen.py
+      checkpoint_file: DetectionModel/dino/dino_r50_4scale_shenzhen.pth
+      checkpoint_sha256: 9bae793d81827fb54547e4f0b2ce8f2179c345bfbe85a84fc2572076acb00bd0
+      device: cpu
+      score_thr: 0.3
+      class_ids: [0]
+      box_mode: ellipse
+
+  max_concurrency: 1
+  fail_fast: true
+  max_masks: 1
+
+  clustering:
+    eps: 0.5
+    min_samples: 2
+    min_unique_experts: 2
+    binarize_threshold: 0.5
+
+  # External VLM filtering is disabled in the public detector release.
+  judging_panel:
+    judges: []
