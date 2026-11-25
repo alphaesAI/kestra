@@ -1,0 +1,227 @@
+id: filenestnodule
+namespace: stage
+description: "Stage pipeline: polls fhir-staging for pending records, splits DICOMs into slices for LungNoduleAgent, and redirects non-DICOM/PDFs to dev.filenestdev"
+
+inputs:
+  - id: fhir_staging_base_url
+    type: STRING
+    defaults: "{{ kv('FHIR_STAGING_BASE_URL') }}"
+    description: "Base URL for fhir-staging service"
+
+  - id: filenest_api_url
+    type: STRING
+    defaults: "{{ kv('FILENEST_API_URL') }}"
+    description: "Base URL for FileNest service"
+
+  - id: filenest_api_key
+    type: STRING
+    defaults: "{{ kv('FILENEST_API_KEY') }}"
+    description: "FileNest API Key"
+
+  - id: filenest_project_id
+    type: STRING
+    defaults: "{{ kv('FILENEST_PROJECT_ID') }}"
+    description: "FileNest Project ID"
+
+  - id: moe_config_path
+    type: STRING
+    defaults: "configs/moe_detection_release.yaml"
+    description: "Path to MoE detection config"
+
+triggers:
+  - id: schedule_check_pending
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "* * * * *"
+
+tasks:
+  # -------------------------------------------------------------------------
+  # 1. Fetch pending records from fhir-staging
+  # -------------------------------------------------------------------------
+  - id: fetch_pending_records
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/?status=pending"
+    method: GET
+    contentType: application/json
+    options:
+      allowFailed: true
+
+  # -------------------------------------------------------------------------
+  # 2. Extract pending records
+  # -------------------------------------------------------------------------
+  - id: filter_pending_records
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra-local:latest
+    pythonVersion: "3.11"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      user: "root"
+    inputFiles:
+      pending_response.json: "{{ outputs.fetch_pending_records.body }}"
+    script: |
+      import json
+      from kestra import Kestra
+
+      with open("pending_response.json", "r", encoding="utf-8") as f:
+          content = f.read().strip()
+          try:
+              data = json.loads(content) if content else {}
+          except Exception:
+              data = {}
+
+      records = data.get("data", []) if isinstance(data, dict) else []
+      valid_records = []
+      for r in records:
+          staging_id = r.get("staging_record_id") or r.get("id")
+          file_id = r.get("file_id")
+          filename = r.get("attachment_title") or r.get("filename") or str(file_id or "unknown")
+          content_type = (r.get("attachment_content_type") or r.get("content_type") or "").lower()
+
+          if staging_id and file_id:
+              valid_records.append({
+                  "staging_record_id": str(staging_id),
+                  "file_id": str(file_id),
+                  "filename": filename,
+                  "content_type": content_type,
+                  "patient_id": str(r.get("patient_id") or ""),
+                  "encounter_id": str(r.get("encounter_id") or ""),
+                  "service_request_id": str(r.get("service_request_id") or ""),
+              })
+
+      print(f"Total pending: {len(records)}, Valid pending: {len(valid_records)}")
+      Kestra.outputs({"records": valid_records, "has_records": len(valid_records) > 0})
+
+  # -------------------------------------------------------------------------
+  # 3. Process each pending record
+  # -------------------------------------------------------------------------
+  - id: process_each_record
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ outputs.filter_pending_records.vars.records }}"
+    tasks:
+      # Step A: Update status to 'processing'
+      - id: update_status_to_processing
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
+        method: PATCH
+        contentType: application/json
+        body: |
+          {
+            "status": "processing",
+            "updated_by": "kestra-filenestnodule"
+          }
+
+      # Step B1: Retrieve fresh staging record details
+      - id: get_staging_record_details
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
+        method: GET
+        contentType: application/json
+
+      # Step B2: Request presigned FileNest download URL
+      - id: get_filenest_download_url
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.filenest_api_url }}/v1/projects/{{ inputs.filenest_project_id }}/files/{{ fromJson(outputs.get_staging_record_details.body).file_id | default(fromJson(item.value).file_id) }}/download?ttl=3600"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ inputs.filenest_api_key }}"
+          Accept: "application/json"
+
+      # Step B3: Download file into Kestra internal storage
+      - id: download_filenest_file
+        type: io.kestra.plugin.core.http.Download
+        uri: "{{ fromJson(outputs.get_filenest_download_url.body).url }}"
+
+      # Step C: Check whether the file is DICOM and split into 2D slices
+      - id: check_and_split_dicom
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: kestra-local:latest
+        pythonVersion: "3.11"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          user: "root"
+        env:
+          ITEM_FILENAME: "{{ fromJson(item.value).filename }}"
+          ITEM_CONTENT_TYPE: "{{ fromJson(item.value).content_type }}"
+        inputFiles:
+          downloaded_file: "{{ outputs.download_filenest_file.uri }}"
+        outputFiles:
+          - "slice_*.npy"
+        script: |
+          import os
+          from pathlib import Path
+          import numpy as np
+          from kestra import Kestra
+
+          file_path = Path("downloaded_file")
+          filename = os.getenv("ITEM_FILENAME", "").lower()
+          content_type = os.getenv("ITEM_CONTENT_TYPE", "").lower()
+
+          def is_dicom_file(path: Path) -> bool:
+              if filename.endswith(".dcm") or "dicom" in content_type:
+                  return True
+              with open(path, "rb") as f:
+                  header = f.read(132)
+              return len(header) >= 132 and header[128:132] == b"DICM"
+
+          if not is_dicom_file(file_path):
+              print(f"File '{filename}' is not DICOM; redirecting to dev.filenestdev.")
+              Kestra.outputs({"is_dicom": False, "slice_files": []})
+          else:
+              import pydicom
+
+              ds = pydicom.dcmread(str(file_path))
+              arr = ds.pixel_array.astype(np.float32)
+
+              slope = float(getattr(ds, "RescaleSlope", 1.0))
+              intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+              arr = arr * slope + intercept
+
+              if arr.ndim == 2:
+                  slices = [arr]
+              elif arr.ndim == 3:
+                  slices = [arr[i] for i in range(arr.shape[0])]
+              else:
+                  raise ValueError(f"Unsupported DICOM pixel_array shape: {arr.shape}")
+
+              slice_files = []
+              for idx, sl in enumerate(slices):
+                  out_name = f"slice_{idx:04d}.npy"
+                  np.save(out_name, sl)
+                  slice_files.append(out_name)
+
+              print(f"Split DICOM '{filename}' into {len(slice_files)} slice(s)")
+              Kestra.outputs({"is_dicom": True, "slice_files": slice_files})
+
+      # Step D: Route DICOM slices to call_load_slice, or redirect non-DICOM/PDF to dev.filenestdev
+      - id: route_by_file_type
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.check_and_split_dicom.vars.is_dicom == true }}"
+        then:
+          - id: process_each_slice
+            type: io.kestra.plugin.core.flow.Loop
+            values: "{{ outputs.check_and_split_dicom.vars.slice_files }}"
+            tasks:
+              - id: call_load_slice
+                type: io.kestra.plugin.scripts.python.Script
+                containerImage: kestra-local:latest
+                pythonVersion: "3.11"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  user: "root"
+                inputFiles:
+                  slice.npy: "{{ outputs.check_and_split_dicom.outputFiles[item.value] }}"
+                outputFiles:
+                  - slice_image.npy
+                script: |
+                  from pathlib import Path
+                  import numpy as np
+                  from nodule_spotter.main import load_slice
+
+                  result = load_slice(Path("slice.npy"))
+                  print("Slice loaded:", result.shape)
+                  np.save("slice_image.npy", result)
+        else:
+          - id: redirect_to_filenestdev
+            type: io.kestra.plugin.core.flow.Subflow
+            namespace: dev
+            flowId: filenestdev
+            wait: false

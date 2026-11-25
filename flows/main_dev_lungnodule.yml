@@ -4,7 +4,7 @@ namespace: dev
 inputs:
   - id: slice_path
     type: STRING
-    defaults: "lung.jpg"
+    defaults: "images/skeptical_cardiologist.jpeg"
 
   - id: moe_config_path
     type: STRING
