@@ -14,3 +14,4 @@ pycocotools>=2.0.7
 mmengine==0.10.7
 mmdet==3.3.0
 litellm>=1.0.0
+pydicom

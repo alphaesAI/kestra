@@ -25,13 +25,13 @@ inputs:
 
   - id: moe_config_path
     type: STRING
-    defaults: "configs/moe_detection_release.yaml"
+    defaults: "configs/moe_detection_release.yaml"  # Make sure this matches your exact namespace file extension
     description: "Path to MoE detection config"
 
 triggers:
   - id: schedule_check_pending
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "* * * * *"
+    cron: "0 0 * * *"
 
 tasks:
   # -------------------------------------------------------------------------
@@ -50,7 +50,7 @@ tasks:
   # -------------------------------------------------------------------------
   - id: filter_pending_records
     type: io.kestra.plugin.scripts.python.Script
-    containerImage: kestra-local:latest
+    containerImage: logialphaesai/kestra-local:latest
     pythonVersion: "3.11"
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -97,7 +97,6 @@ tasks:
     type: io.kestra.plugin.core.flow.Loop
     values: "{{ outputs.filter_pending_records.vars.records }}"
     tasks:
-      # Step A: Update status to 'processing'
       - id: update_status_to_processing
         type: io.kestra.plugin.core.http.Request
         uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
@@ -109,14 +108,20 @@ tasks:
             "updated_by": "kestra-filenestnodule"
           }
 
-      # Step B1: Retrieve fresh staging record details
+      - id: log_update_status
+        type: io.kestra.plugin.core.log.Log
+        message: "Updated staging record {{ fromJson(item.value).staging_record_id }} to processing (status={{ outputs.update_status_to_processing.code }})"
+
       - id: get_staging_record_details
         type: io.kestra.plugin.core.http.Request
         uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
         method: GET
         contentType: application/json
 
-      # Step B2: Request presigned FileNest download URL
+      - id: log_staging_record_details
+        type: io.kestra.plugin.core.log.Log
+        message: "Fetched staging record details for {{ fromJson(item.value).staging_record_id }} (status={{ outputs.get_staging_record_details.code }})"
+
       - id: get_filenest_download_url
         type: io.kestra.plugin.core.http.Request
         uri: "{{ inputs.filenest_api_url }}/v1/projects/{{ inputs.filenest_project_id }}/files/{{ fromJson(outputs.get_staging_record_details.body).file_id | default(fromJson(item.value).file_id) }}/download?ttl=3600"
@@ -125,15 +130,21 @@ tasks:
           Authorization: "Bearer {{ inputs.filenest_api_key }}"
           Accept: "application/json"
 
-      # Step B3: Download file into Kestra internal storage
+      - id: log_filenest_download_url
+        type: io.kestra.plugin.core.log.Log
+        message: "Retrieved FileNest download URL for file {{ fromJson(item.value).file_id }} (status={{ outputs.get_filenest_download_url.code }})"
+
       - id: download_filenest_file
         type: io.kestra.plugin.core.http.Download
         uri: "{{ fromJson(outputs.get_filenest_download_url.body).url }}"
 
-      # Step C: Check whether the file is DICOM and split into 2D slices
+      - id: log_download_filenest_file
+        type: io.kestra.plugin.core.log.Log
+        message: "Downloaded file {{ fromJson(item.value).filename }} to {{ outputs.download_filenest_file.uri }}"
+
       - id: check_and_split_dicom
         type: io.kestra.plugin.scripts.python.Script
-        containerImage: kestra-local:latest
+        containerImage: logialphaesai/kestra-local:latest
         pythonVersion: "3.11"
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -191,7 +202,6 @@ tasks:
               print(f"Split DICOM '{filename}' into {len(slice_files)} slice(s)")
               Kestra.outputs({"is_dicom": True, "slice_files": slice_files})
 
-      # Step D: Route DICOM slices to call_load_slice, or redirect non-DICOM/PDF to dev.filenestdev
       - id: route_by_file_type
         type: io.kestra.plugin.core.flow.If
         condition: "{{ outputs.check_and_split_dicom.vars.is_dicom == true }}"
@@ -202,7 +212,7 @@ tasks:
             tasks:
               - id: call_load_slice
                 type: io.kestra.plugin.scripts.python.Script
-                containerImage: kestra-local:latest
+                containerImage: logialphaesai/kestra-local:latest
                 pythonVersion: "3.11"
                 taskRunner:
                   type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -219,9 +229,255 @@ tasks:
                   result = load_slice(Path("slice.npy"))
                   print("Slice loaded:", result.shape)
                   np.save("slice_image.npy", result)
+
+              - id: run_moe
+                type: io.kestra.plugin.scripts.python.Script
+                containerImage: logialphaesai/kestra-local:latest
+                namespaceFiles:
+                  enabled: true
+                  include:
+                    - configs/**
+                pythonVersion: "3.11"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  user: "root"
+                inputFiles:
+                  slice_image.npy: "{{ outputs.call_load_slice.outputFiles['slice_image.npy'] }}"
+                outputFiles:
+                  - candidates.pkl
+                script: |
+                  import asyncio
+                  import pickle
+                  import numpy as np
+
+                  from kestra import Kestra
+                  from nodule_spotter.detectors import build_detector
+                  from nodule_spotter.moe import MixtureOfExperts
+                  from nodule_spotter.settings import SpotterSettings
+
+                  slice_image = np.load("slice_image.npy")
+                  settings = SpotterSettings.load("{{ inputs.moe_config_path }}")
+
+                  detectors = [build_detector(spec) for spec in settings.detectors]
+                  moe = MixtureOfExperts(
+                      detectors,
+                      max_concurrency=settings.max_concurrency,
+                      fail_fast=settings.fail_fast,
+                  )
+
+                  candidates = asyncio.run(moe.run_slice(slice_image, slice_idx=0))
+                  print(f"MoE produced {len(candidates)} raw mask candidate(s)")
+
+                  with open("candidates.pkl", "wb") as f:
+                      pickle.dump(candidates, f)
+
+                  Kestra.outputs({
+                      "num_candidates": len(candidates),
+                      "candidate_sources": [c.source for c in candidates],
+                  })
+
+              - id: run_clusterer
+                type: io.kestra.plugin.scripts.python.Script
+                containerImage: logialphaesai/kestra-local:latest
+                namespaceFiles:
+                  enabled: true
+                  include:
+                    - configs/**
+                pythonVersion: "3.11"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  user: "root"
+                inputFiles:
+                  candidates.pkl: "{{ outputs.run_moe.outputFiles['candidates.pkl'] }}"
+                outputFiles:
+                  - clusters.pkl
+                script: |
+                  import pickle
+                  from kestra import Kestra
+                  from nodule_spotter.clustering import MaskClusterer
+                  from nodule_spotter.settings import SpotterSettings
+
+                  with open("candidates.pkl", "rb") as f:
+                      candidates = pickle.load(f)
+
+                  settings = SpotterSettings.load("{{ inputs.moe_config_path }}")
+                  clusterer = MaskClusterer(
+                      eps=settings.clustering.eps,
+                      min_samples=settings.clustering.min_samples,
+                      min_unique_experts=settings.clustering.min_unique_experts,
+                      binarize_threshold=settings.clustering.binarize_threshold,
+                  )
+
+                  clusters = clusterer.cluster(candidates)
+                  print(f"Clusterer generated {len(clusters)} cluster(s)")
+
+                  with open("clusters.pkl", "wb") as f:
+                      pickle.dump(clusters, f)
+
+                  summary = [
+                      {
+                          "cluster_id": c.cluster_id,
+                          "is_noise": c.is_noise,
+                          "sources": c.sources(),
+                          "member_count": len(c.members),
+                      }
+                      for c in clusters
+                  ]
+
+                  Kestra.outputs({
+                      "num_clusters": len(clusters),
+                      "clusters_summary": summary,
+                  })
+
+              - id: run_judging_panel
+                type: io.kestra.plugin.scripts.python.Script
+                containerImage: logialphaesai/kestra-local:latest
+                namespaceFiles:
+                  enabled: true
+                  include:
+                    - configs/**
+                pythonVersion: "3.11"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  user: "root"
+                inputFiles:
+                  slice_image.npy: "{{ outputs.call_load_slice.outputFiles['slice_image.npy'] }}"
+                  clusters.pkl: "{{ outputs.run_clusterer.outputFiles['clusters.pkl'] }}"
+                outputFiles:
+                  - judged.pkl
+                script: |
+                  import asyncio
+                  import pickle
+                  import numpy as np
+                  from kestra import Kestra
+                  from nodule_spotter.settings import SpotterSettings
+                  from nodule_spotter.judging_panel import JudgingPanel, VLMJudge
+                  from nodule_spotter.types import JudgedMask
+
+                  slice_image = np.load("slice_image.npy")
+                  with open("clusters.pkl", "rb") as f:
+                      clusters = pickle.load(f)
+
+                  settings = SpotterSettings.load("{{ inputs.moe_config_path }}")
+
+                  judges = [
+                      VLMJudge(
+                          name=j.name,
+                          model=j.spec.litellm_model(temperature=j.temperature),
+                          input_mode=settings.panel.input_mode,
+                      )
+                      for j in settings.panel.judges
+                  ]
+
+                  if judges:
+                      panel = JudgingPanel(judges=judges, accept_threshold=settings.panel.accept_threshold)
+                      judged = asyncio.run(panel.evaluate_all(slice_image, clusters))
+                  else:
+                      judged = [
+                          JudgedMask(
+                              cluster=c,
+                              votes=[],
+                              score=0.0 if c.is_noise else 1.0,
+                              accepted=not c.is_noise,
+                          )
+                          for c in clusters
+                      ]
+
+                  with open("judged.pkl", "wb") as f:
+                      pickle.dump(judged, f)
+
+                  accepted_count = sum(1 for j in judged if j.accepted)
+                  print(f"Judging finished: {accepted_count}/{len(judged)} cluster(s) accepted")
+
+                  Kestra.outputs({
+                      "total_judged": len(judged),
+                      "accepted_count": accepted_count,
+                      "vlm_enabled": bool(judges),
+                  })
+
+              - id: select_and_output
+                type: io.kestra.plugin.scripts.python.Script
+                containerImage: logialphaesai/kestra-local:latest
+                namespaceFiles:
+                  enabled: true
+                  include:
+                    - configs/**
+                pythonVersion: "3.11"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  user: "root"
+                inputFiles:
+                  candidates.pkl: "{{ outputs.run_moe.outputFiles['candidates.pkl'] }}"
+                  judged.pkl: "{{ outputs.run_judging_panel.outputFiles['judged.pkl'] }}"
+                outputFiles:
+                  - trace_summary.json
+                  - "*.png"
+                script: |
+                  import json
+                  import pickle
+                  from pathlib import Path
+                  from kestra import Kestra
+                  from nodule_spotter.settings import SpotterSettings
+                  from nodule_spotter.pipeline import select_top_masks
+                  from nodule_spotter.types import SpotterOutput
+                  from nodule_spotter.main import save_mask, trace
+
+                  with open("candidates.pkl", "rb") as f:
+                      candidates = pickle.load(f)
+                  with open("judged.pkl", "rb") as f:
+                      judged = pickle.load(f)
+
+                  settings = SpotterSettings.load("{{ inputs.moe_config_path }}")
+
+                  final_masks = select_top_masks(judged, max_masks=settings.max_masks)
+
+                  output = SpotterOutput(
+                      slice_idx=0,
+                      final_masks=final_masks,
+                      judged=judged,
+                      raw_candidates=candidates,
+                  )
+
+                  summary_data = trace(output)
+                  Path("trace_summary.json").write_text(json.dumps(summary_data, indent=2), encoding="utf-8")
+
+                  saved_mask_files = []
+                  for k, mask in enumerate(final_masks):
+                      filename = f"slice_mask_{k}.png"
+                      save_mask(mask, Path(filename))
+                      saved_mask_files.append(filename)
+
+                  print(f"Final Output: {len(final_masks)} mask(s) saved: {saved_mask_files}")
+
+                  Kestra.outputs({
+                      "num_final_masks": len(final_masks),
+                      "mask_files": saved_mask_files,
+                      "trace": summary_data,
+                  })
         else:
+          - id: log_redirect_to_filenestdev
+            type: io.kestra.plugin.core.log.Log
+            message: "Redirecting non-DICOM file {{ fromJson(item.value).filename }} to dev.filenestdev"
+
           - id: redirect_to_filenestdev
             type: io.kestra.plugin.core.flow.Subflow
             namespace: dev
             flowId: filenestdev
             wait: false
+    errors:
+      - id: revert_status_to_pending
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
+        method: PATCH
+        contentType: application/json
+        options:
+          allowFailed: true
+        body: |
+          {
+            "status": "pending",
+            "updated_by": "kestra-filenestnodule"
+          }
+
+      - id: log_revert_status_to_pending
+        type: io.kestra.plugin.core.log.Log
+        message: "Reverted staging record {{ fromJson(item.value).staging_record_id }} back to pending after failure (status={{ outputs.revert_status_to_pending.code }})"
