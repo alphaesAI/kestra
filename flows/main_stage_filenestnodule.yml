@@ -25,7 +25,7 @@ inputs:
 
   - id: moe_config_path
     type: STRING
-    defaults: "configs/moe_detection_release.yaml"  # Make sure this matches your exact namespace file extension
+    defaults: "configs/moe_detection_release.yml"  # Make sure this matches your exact namespace file extension
     description: "Path to MoE detection config"
 
 triggers:
@@ -96,6 +96,7 @@ tasks:
   - id: process_each_record
     type: io.kestra.plugin.core.flow.Loop
     values: "{{ outputs.filter_pending_records.vars.records }}"
+    concurrencyLimit: 1
     tasks:
       - id: update_status_to_processing
         type: io.kestra.plugin.core.http.Request
@@ -209,6 +210,7 @@ tasks:
           - id: process_each_slice
             type: io.kestra.plugin.core.flow.Loop
             values: "{{ outputs.check_and_split_dicom.vars.slice_files }}"
+            concurrencyLimit: 1
             tasks:
               - id: call_load_slice
                 type: io.kestra.plugin.scripts.python.Script
@@ -241,6 +243,9 @@ tasks:
                 taskRunner:
                   type: io.kestra.plugin.scripts.runner.docker.Docker
                   user: "root"
+                env:
+                  HF_HOME: /root/.cache/huggingface
+                  HF_HUB_OFFLINE: "1"
                 inputFiles:
                   slice_image.npy: "{{ outputs.call_load_slice.outputFiles['slice_image.npy'] }}"
                 outputFiles:
@@ -340,6 +345,9 @@ tasks:
                 taskRunner:
                   type: io.kestra.plugin.scripts.runner.docker.Docker
                   user: "root"
+                env:
+                  HF_HOME: /root/.cache/huggingface
+                  HF_HUB_OFFLINE: "1"
                 inputFiles:
                   slice_image.npy: "{{ outputs.call_load_slice.outputFiles['slice_image.npy'] }}"
                   clusters.pkl: "{{ outputs.run_clusterer.outputFiles['clusters.pkl'] }}"

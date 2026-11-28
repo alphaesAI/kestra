@@ -31,6 +31,13 @@ COPY README.md       /app/
 # 4. Install remaining dependencies into the virtual environment
 RUN uv pip install -r /app/requirements.txt
 
+# 5. Pre-download HuggingFace MoE models into /root/.cache/huggingface
+RUN PYTHONPATH=/app/src:/app HF_HOME=/root/.cache/huggingface python -c "\
+from nodule_spotter.detectors import build_detector; \
+from nodule_spotter.settings import SpotterSettings; \
+s = SpotterSettings.load('/app/src/nodule_spotter/configs/moe_detection_release.yaml'); \
+[build_detector(spec).warmup() for spec in s.detectors]"
+
 USER kestra
 ENV PYTHONPATH=/app/src:/app
 ENV APP_DIR=/app
